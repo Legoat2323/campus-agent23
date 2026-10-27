@@ -1,0 +1,11 @@
+# 隐藏虚拟环境
+.venv/
+
+# 隐藏 API Key 文件（千万不能传到网上去）
+.env
+
+# 隐藏本地数据库文件夹
+chroma_db/
+
+# 隐藏 Python 缓存
+__pycache__/
