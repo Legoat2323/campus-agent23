@@ -4,7 +4,13 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="82f8f871-4955-4cb1-abca-d0cc569d2449" name="Changes" comment="" />
+    <list default="true" id="82f8f871-4955-4cb1-abca-d0cc569d2449" name="Changes" comment="init project">
+      <change afterPath="$PROJECT_DIR$/data/01_报到前.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/02_报到当天.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/03_入学第一周.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/04_校园生活.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -21,6 +27,18 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;Legoat2323&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/Legoat2323/campus-agent23.git&quot;,
+    &quot;accountId&quot;: &quot;d7d07e6e-cef3-4783-b267-01b13f155814&quot;
+  }
+}</component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 0,
   &quot;fromUser&quot;: false
@@ -38,15 +56,26 @@
     "Python.main2.executor": "Run",
     "Python.main3.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "codeWithMe.voiceChat.enabledByDefault": "false",
     "git-widget-placeholder": "master",
+    "last_opened_file_path": "D:/develop/campus-agent",
     "node.js.detected.package.jshint": "true",
     "node.js.selected.package.jshint": "",
     "nodejs_package_manager_path": "npm"
   }
 }]]></component>
-  <component name="RunManager" selected="Python.main3">
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="D:\develop\campus-agent" />
+      <recent name="D:\develop\campus-agent\chroma_db\752b8174-0481-4a59-b810-371dacceaf79" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="D:\develop\campus-agent\data" />
+    </key>
+  </component>
+  <component name="RunManager" selected="Python.build_db">
     <configuration name="build_db" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="campus-agent" />
       <option name="ENV_FILES" value="" />
@@ -145,7 +174,6 @@
     </configuration>
     <recent_temporary>
       <list>
-        <item itemvalue="Python.main3" />
         <item itemvalue="Python.main2" />
         <item itemvalue="Python.main" />
         <item itemvalue="Python.build_db" />
@@ -167,9 +195,33 @@
       <option name="presentableId" value="Default" />
       <updated>1792983495359</updated>
     </task>
+    <task id="LOCAL-00001" summary="init project">
+      <option name="closed" value="true" />
+      <created>1793085372157</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1793085372157</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="init project" />
+    <option name="LAST_COMMIT_MESSAGE" value="init project" />
   </component>
 </project>
