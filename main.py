@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 import time
 import json
-
+from fastapi.staticfiles import StaticFiles
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
@@ -34,6 +34,19 @@ app = FastAPI(title="我的校园Agent")
 # 3. 全局变量：用来存各个用户的聊天记录
 chat_histories = {}
 
+#阈值分数
+RELEVANCE_THRESHOLD = 1.0
+
+SYSTEM_PROMPT_TMPL = """你是桂林电子科技大学的校园助手，服务对象是新入学的大一新生。
+
+【必须遵守的规则】
+1. 只依据下面【资料】里的内容回答，不要使用你自己的知识。
+2. 如果【资料】里没有答案，直接回复："这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。"
+3. 禁止编造店名、价格、电话、时间等具体信息。
+4. 回答简洁，不超过 5 句话。
+
+【资料】
+{context}"""
 
 # 4. 定义请求体（新增了 session_id）
 class ChatRequest(BaseModel):
@@ -43,12 +56,14 @@ class ChatRequest(BaseModel):
 
 # --- RAG 检索函数 ---
 def get_school_context(question: str) -> str:
-    try:
-        docs = vectorstore.similarity_search(question, k=2)
-        return "\n".join([doc.page_content for doc in docs])
-    except Exception as e:
-        print(f"检索出错: {e}")
-        return ""
+        try:
+            results = vectorstore.similarity_search_with_score(question, k=3)
+            # 只保留距离小于阈值的片段；超出的说明不相关，直接丢弃
+            useful = [doc for doc, score in results if score < RELEVANCE_THRESHOLD]
+            return "\n".join(doc.page_content for doc in useful)
+        except Exception as e:
+            print(f"检索出错: {e}")
+            return ""
 
 
 # --- Agent 工具定义 ---
@@ -91,7 +106,9 @@ async def chat(request: ChatRequest):
 
     # 2. 去向量库拿背景知识
     context = get_school_context(request.query)
-    system_prompt = f"你是一个校园助手。请结合历史对话和以下资料回答问题：\n{context}"
+    if not context.strip():
+        return {"answer": "这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。"}
+    system_prompt = SYSTEM_PROMPT_TMPL.format(context=context)
 
     # 3. 组装发送给大模型的消息：系统提示 + 历史记忆 + 当前问题
     messages = [{"role": "system", "content": system_prompt}]
@@ -174,7 +191,7 @@ async def chat_stream(request: ChatRequest):
     history = chat_histories[request.session_id]
 
     context = get_school_context(request.query)
-    system_prompt = f"你是一个校园助手。请结合历史对话和以下资料回答问题：\n{context}"
+    system_prompt = SYSTEM_PROMPT_TMPL.format(context=context)
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
@@ -182,6 +199,9 @@ async def chat_stream(request: ChatRequest):
 
     def generate():
         full_answer = ""
+        if not context.strip():
+            yield "data: 这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。\n\n"
+            return
         try:
             # 【第一阶段：非流式判断是否需要调用工具】
             # 注意这里没有 stream=True，而且带上了 tools
@@ -238,6 +258,11 @@ async def chat_stream(request: ChatRequest):
             yield f"data: [ERROR] {str(e)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+app.mount("/", StaticFiles(directory="static",html=True), name="static")
+
+
 if __name__ == "__main__":
     import uvicorn
 
