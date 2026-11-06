@@ -1,42 +1,137 @@
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from openai import OpenAI, RateLimitError
-import os
-from dotenv import load_dotenv
-import time
-import json
-from fastapi.staticfiles import StaticFiles
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
+"""校园智能 Agent 问答服务。
 
-# 加载环境变量
+改造说明（相对上一版）：
+1. 会话记忆从内存 dict 换成 SQLite —— 重启不丢，多进程也能共享
+2. 错误处理改用 HTTPException —— 客户端能区分成功/失败，不再一律 200
+3. print 换成 logging —— 能落盘、能分级、带时间戳
+"""
+import json
+import logging
+import os
+import sqlite3
+import time
+from contextlib import closing
+
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from openai import OpenAI, RateLimitError
+from pydantic import BaseModel
+
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
 load_dotenv()
 
-# 1. 初始化聊天模型（智谱）
+# ----------------------------------------------------------------------------
+# 日志：按时间戳 + 级别输出，以后要落盘只需再加一个 FileHandler
+# ----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("campus")
+
+
+# ----------------------------------------------------------------------------
+# 模型与向量库
+# ----------------------------------------------------------------------------
 client = OpenAI(
     api_key=os.getenv("ZHIPU_API_KEY"),
     base_url="https://open.bigmodel.cn/api/paas/v4/",
 )
 
-# 2. 初始化向量模型并连接本地数据库
 embeddings = OpenAIEmbeddings(
     api_key=os.getenv("ZHIPU_API_KEY"),
     base_url="https://open.bigmodel.cn/api/paas/v4/",
     model="embedding-2",
-    check_embedding_ctx_length=False
+    check_embedding_ctx_length=False,
 )
-print("正在连接向量数据库...")
+log.info("正在连接向量数据库 ...")
 vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 
 app = FastAPI(title="我的校园Agent")
 
-# 3. 全局变量：用来存各个用户的聊天记录
-chat_histories = {}
-
-#阈值分数
+# 检索距离阈值：超过它的片段视为不相关，直接丢弃。
+# 实测库内问题最高 0.87、库外最低 1.18，取中间值。
 RELEVANCE_THRESHOLD = 1.0
 
+# ----------------------------------------------------------------------------
+# 会话记忆：SQLite
+#
+# 为什么不用全局 dict：
+#   - 进程重启就丢
+#   - uvicorn 开多个 worker 时各存各的
+#   - 只有上限没有清理，内存只涨不降
+# ----------------------------------------------------------------------------
+DB_PATH = "memory.db"
+HISTORY_LIMIT = 6  # 只保留最近 3 轮（user + assistant 各 3 条）
+
+
+def init_db() -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session ON messages(session_id, id)"
+        )
+        conn.commit()
+
+
+def load_history(session_id: str, limit: int = HISTORY_LIMIT) -> list[dict]:
+    """取最近 limit 条消息，按时间正序返回，可直接喂给模型。"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id=? "
+            "ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    return [{"role": role, "content": text} for role, text in reversed(rows)]
+
+
+def append_message(session_id: str, role: str, content: str) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content),
+        )
+        conn.commit()
+
+
+def trim_history(session_id: str, keep: int = HISTORY_LIMIT) -> None:
+    """只保留最近 keep 条，避免数据库无限增长。"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE session_id=? AND id NOT IN "
+            "(SELECT id FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?)",
+            (session_id, session_id, keep),
+        )
+        conn.commit()
+
+
+init_db()
+
+
+class ChatRequest(BaseModel):
+    session_id: str = "default_user"
+    query: str
+
+
+# ----------------------------------------------------------------------------
+# 检索
+# ----------------------------------------------------------------------------
 SYSTEM_PROMPT_TMPL = """你是桂林电子科技大学的校园助手，服务对象是新入学的大一新生。
 
 【必须遵守的规则】
@@ -48,31 +143,29 @@ SYSTEM_PROMPT_TMPL = """你是桂林电子科技大学的校园助手，服务�
 【资料】
 {context}"""
 
-# 4. 定义请求体（新增了 session_id）
-class ChatRequest(BaseModel):
-    session_id: str = "default_user"
-    query: str
+NO_DATA_ANSWER = "这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。"
 
 
-# --- RAG 检索函数 ---
 def get_school_context(question: str) -> str:
-        try:
-            results = vectorstore.similarity_search_with_score(question, k=3)
-            # 只保留距离小于阈值的片段；超出的说明不相关，直接丢弃
-            useful = [doc for doc, score in results if score < RELEVANCE_THRESHOLD]
-            return "\n".join(doc.page_content for doc in useful)
-        except Exception as e:
-            print(f"检索出错: {e}")
-            return ""
+    """检索知识库，只返回相关度够高的片段。"""
+    try:
+        results = vectorstore.similarity_search_with_score(question, k=3)
+        useful = [doc for doc, score in results if score < RELEVANCE_THRESHOLD]
+        log.info("检索命中 %d/%d 条（阈值 %.1f）", len(useful), len(results), RELEVANCE_THRESHOLD)
+        return "\n".join(doc.page_content for doc in useful)
+    except Exception:
+        log.exception("检索出错，按无资料处理")
+        return ""
 
 
-# --- Agent 工具定义 ---
+# ----------------------------------------------------------------------------
+# 工具
+# ----------------------------------------------------------------------------
 def get_weather(city: str) -> str:
-    print(f"🚨 [Agent正在干活] 大模型调用了天气工具，参数：{city}")
+    log.info("Agent 调用天气工具，参数=%s", city)
     if "桂林" in city:
         return "桂林今天中雨，气温 20-25 度，记得带伞。"
-    else:
-        return f"{city}今天晴，气温 22-28 度。"
+    return f"{city}今天晴，气温 22-28 度。"
 
 
 tools = [
@@ -84,10 +177,7 @@ tools = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "城市名称，例如：桂林、北京",
-                    }
+                    "city": {"type": "string", "description": "城市名称，例如：桂林、北京"}
                 },
                 "required": ["city"],
             },
@@ -96,174 +186,150 @@ tools = [
 ]
 
 
-# --- 主接口 ---
+def build_messages(session_id: str, query: str, context: str) -> list[dict]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT_TMPL.format(context=context)}]
+    messages.extend(load_history(session_id))
+    messages.append({"role": "user", "content": query})
+    return messages
+
+
+# ----------------------------------------------------------------------------
+# 接口
+# ----------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    """健康检查：部署时用来确认服务活着。"""
+    return {"status": "ok"}
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    # 1. 获取该用户的历史记忆（如果不存在则创建）
-    if request.session_id not in chat_histories:
-        chat_histories[request.session_id] = []
-    history = chat_histories[request.session_id]
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query 不能为空")
 
-    # 2. 去向量库拿背景知识
-    context = get_school_context(request.query)
+    context = get_school_context(query)
     if not context.strip():
-        return {"answer": "这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。"}
-    system_prompt = SYSTEM_PROMPT_TMPL.format(context=context)
+        log.info("无相关资料，直接返回兜底话术 session=%s", request.session_id)
+        return {"answer": NO_DATA_ANSWER}
 
-    # 3. 组装发送给大模型的消息：系统提示 + 历史记忆 + 当前问题
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": request.query})
-
+    messages = build_messages(request.session_id, query, context)
     max_retries = 3
+
     for attempt in range(max_retries):
         try:
-            # 【第一次请求大模型】：决定是否调用工具
             response = client.chat.completions.create(
-                model="glm-4-flash",
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
+                model="glm-4-flash", messages=messages, tools=tools, tool_choice="auto"
             )
-
             response_message = response.choices[0].message
             final_answer = None
 
-            # 判断是否调用了工具
             if response_message.tool_calls:
-                # 把大模型的“调用决定”加入当前上下文
                 messages.append(response_message)
-
                 for tool_call in response_message.tool_calls:
                     if tool_call.function.name == "get_weather":
                         args = json.loads(tool_call.function.arguments)
-                        weather_result = get_weather(args.get("city"))
-
-                        # 把工具结果塞回上下文
                         messages.append({
                             "tool_call_id": tool_call.id,
                             "role": "tool",
                             "name": tool_call.function.name,
-                            "content": weather_result,
+                            "content": get_weather(args.get("city")),
                         })
-
-                # 【第二次请求大模型】：根据工具结果生成最终回答
-                second_response = client.chat.completions.create(
-                    model="glm-4-flash",
-                    messages=messages,
+                second = client.chat.completions.create(
+                    model="glm-4-flash", messages=messages
                 )
-                final_answer = second_response.choices[0].message.content
+                final_answer = second.choices[0].message.content
             else:
-                # 没调用工具，直接拿结果
                 final_answer = response_message.content
 
-            # 兜底保护：防止大模型真的吐空字符串
             if not final_answer:
-                final_answer = "抱歉，我大脑短路了一下，请重新问一次。"
+                final_answer = "抱歉，我这边没有生成有效回答，请再问一次。"
 
-            # 4. 存入历史记忆（只存纯文本，保持记忆干净）
-            history.append({"role": "user", "content": request.query})
-            history.append({"role": "assistant", "content": final_answer})
-
-            # 控制记忆长度，只保留最近 6 条（3轮对话），防止 Token 爆炸
-            if len(history) > 6:
-                chat_histories[request.session_id] = history[-6:]
+            # 写入记忆并裁剪
+            append_message(request.session_id, "user", query)
+            append_message(request.session_id, "assistant", final_answer)
+            trim_history(request.session_id)
 
             return {"answer": final_answer}
 
         except RateLimitError:
             if attempt == max_retries - 1:
-                return {"error": "请求太频繁了，请等一分钟后再试"}
-            wait_time = 2 ** attempt
-            print(f"触发限流了，正在等待 {wait_time} 秒后重试...")
-            time.sleep(wait_time)
+                log.warning("触发限流且重试耗尽 session=%s", request.session_id)
+                raise HTTPException(status_code=429, detail="请求太频繁，请稍后再试")
+            wait = 2 ** attempt
+            log.warning("触发限流，%d 秒后重试（第 %d 次）", wait, attempt + 1)
+            time.sleep(wait)
 
-        except Exception as e:
-            print(f"运行报错: {e}")
-            return {"error": f"发生错误: {str(e)}"}
+        except HTTPException:
+            raise
+
+        except Exception:
+            log.exception("处理请求失败 session=%s", request.session_id)
+            raise HTTPException(status_code=500, detail="服务内部错误，请稍后再试")
 
 
 @app.post("/chat_stream")
 async def chat_stream(request: ChatRequest):
-    # 1. 准备基础上下文和记忆
-    if request.session_id not in chat_histories:
-        chat_histories[request.session_id] = []
-    history = chat_histories[request.session_id]
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query 不能为空")
 
-    context = get_school_context(request.query)
-    system_prompt = SYSTEM_PROMPT_TMPL.format(context=context)
+    context = get_school_context(query)
+    if not context.strip():
+        def no_data():
+            yield f"data: {NO_DATA_ANSWER}\n\n"
+        return StreamingResponse(no_data(), media_type="text/event-stream")
 
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": request.query})
+    messages = build_messages(request.session_id, query, context)
 
     def generate():
         full_answer = ""
-        if not context.strip():
-            yield "data: 这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。\n\n"
-            return
         try:
-            # 【第一阶段：非流式判断是否需要调用工具】
-            # 注意这里没有 stream=True，而且带上了 tools
-            first_response = client.chat.completions.create(
-                model="glm-4-flash",
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
+            # 第一阶段：非流式，判断要不要调工具
+            # （流式响应里拿不到完整的 tool_calls，所以必须先用非流式问一次）
+            first = client.chat.completions.create(
+                model="glm-4-flash", messages=messages, tools=tools, tool_choice="auto"
             )
+            response_message = first.choices[0].message
 
-            response_message = first_response.choices[0].message
-
-            # 如果大模型决定调用工具
             if response_message.tool_calls:
                 messages.append(response_message)
-
                 for tool_call in response_message.tool_calls:
                     if tool_call.function.name == "get_weather":
                         args = json.loads(tool_call.function.arguments)
-                        weather_result = get_weather(args.get("city"))
-
                         messages.append({
                             "tool_call_id": tool_call.id,
                             "role": "tool",
                             "name": tool_call.function.name,
-                            "content": weather_result,
+                            "content": get_weather(args.get("city")),
                         })
-
-                # 告诉前端，工具跑完了，准备开始输出最终答案
                 yield "data: [系统提示：已获取实时天气，正在生成回答...]\n\n"
 
-            # 【第二阶段：开启流式输出】
-            # 现在 messages 里已经包含了工具的结果（或者模型一开始就决定不需要工具）
-            # 此时加上 stream=True，让它一个字一个字吐出来
-            stream_response = client.chat.completions.create(
-                model="glm-4-flash",
-                messages=messages,
-                stream=True
+            # 第二阶段：带上工具结果，开启流式
+            stream = client.chat.completions.create(
+                model="glm-4-flash", messages=messages, stream=True
             )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    full_answer += delta
+                    yield f"data: {delta}\n\n"
 
-            for chunk in stream_response:
-                if chunk.choices[0].delta.content:
-                    text = chunk.choices[0].delta.content
-                    full_answer += text
-                    yield f"data: {text}\n\n"
+            append_message(request.session_id, "user", query)
+            append_message(request.session_id, "assistant", full_answer)
+            trim_history(request.session_id)
+            log.info("流式回答完成 session=%s 长度=%d", request.session_id, len(full_answer))
 
-            # 3. 流式结束后，把这一轮对话存入记忆
-            history.append({"role": "user", "content": request.query})
-            history.append({"role": "assistant", "content": full_answer})
-            if len(history) > 6:
-                chat_histories[request.session_id] = history[-6:]
-
-        except Exception as e:
-            yield f"data: [ERROR] {str(e)}\n\n"
+        except Exception:
+            log.exception("流式回答失败 session=%s", request.session_id)
+            yield "data: [ERROR] 服务出错了，请稍后再试\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-app.mount("/", StaticFiles(directory="static",html=True), name="static")
+# 前端页面（必须在所有接口之后挂载）
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 
 if __name__ == "__main__":
-    import uvicorn
-
     uvicorn.run(app, host="127.0.0.1", port=8000)

@@ -9,4 +9,8 @@ chroma_db/
 
 # 隐藏 Python 缓存
 __pycache__/
+
+
 .idea/
+
+memory.db
