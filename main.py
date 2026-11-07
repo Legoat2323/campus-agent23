@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI, RateLimitError
 from pydantic import BaseModel
 
+from weather import get_weather
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 
@@ -139,6 +140,7 @@ SYSTEM_PROMPT_TMPL = """你是桂林电子科技大学的校园助手，服务�
 2. 如果【资料】里没有答案，直接回复："这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。"
 3. 禁止编造店名、价格、电话、时间等具体信息。
 4. 回答简洁，不超过 5 句话。
+5. 如果【资料】里没有内容，但用户问的是天气这类可以用工具查询的信息，请调用工具，不要直接拒答。
 
 【资料】
 {context}"""
@@ -161,11 +163,10 @@ def get_school_context(question: str) -> str:
 # ----------------------------------------------------------------------------
 # 工具
 # ----------------------------------------------------------------------------
-def get_weather(city: str) -> str:
-    log.info("Agent 调用天气工具，参数=%s", city)
-    if "桂林" in city:
-        return "桂林今天中雨，气温 20-25 度，记得带伞。"
-    return f"{city}今天晴，气温 22-28 度。"
+# 天气工具的真实实现在 weather.py：
+#   - 数据来自 Open-Meteo（免费、无需 API key）
+#   - 内置常用城市别名表，解决中文地名匹配不准的问题
+#   - 带 10 分钟缓存，避免重复请求
 
 
 tools = [
@@ -173,7 +174,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "查询指定城市的实时天气情况",
+            "description": "查询指定城市的实时天气（真实数据，来自 Open-Meteo）",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -208,11 +209,10 @@ async def chat(request: ChatRequest):
     if not query:
         raise HTTPException(status_code=400, detail="query 不能为空")
 
+    # 注意：这里不能因为"知识库没资料"就直接兜底。
+    # 天气这类问题本来就不在知识库里，答案是靠工具查的，
+    # 提前返回会让工具永远没机会被调用。兜底放在"模型没调工具"之后。
     context = get_school_context(query)
-    if not context.strip():
-        log.info("无相关资料，直接返回兜底话术 session=%s", request.session_id)
-        return {"answer": NO_DATA_ANSWER}
-
     messages = build_messages(request.session_id, query, context)
     max_retries = 3
 
@@ -240,6 +240,10 @@ async def chat(request: ChatRequest):
                 )
                 final_answer = second.choices[0].message.content
             else:
+                # 没调工具：知识库也没有资料，说明这个问题我们答不了
+                if not context.strip():
+                    log.info("无资料且未调用工具，返回兜底 session=%s", request.session_id)
+                    return {"answer": NO_DATA_ANSWER}
                 final_answer = response_message.content
 
             if not final_answer:
@@ -274,12 +278,9 @@ async def chat_stream(request: ChatRequest):
     if not query:
         raise HTTPException(status_code=400, detail="query 不能为空")
 
+    # 和 /chat 一样：不能因为知识库没资料就提前返回，否则工具永远调不到。
+    # 兜底放在"模型决定不调工具"之后（见 generate 里的 elif）。
     context = get_school_context(query)
-    if not context.strip():
-        def no_data():
-            yield f"data: {NO_DATA_ANSWER}\n\n"
-        return StreamingResponse(no_data(), media_type="text/event-stream")
-
     messages = build_messages(request.session_id, query, context)
 
     def generate():
@@ -304,6 +305,10 @@ async def chat_stream(request: ChatRequest):
                             "content": get_weather(args.get("city")),
                         })
                 yield "data: [系统提示：已获取实时天气，正在生成回答...]\n\n"
+            elif not context.strip():
+                log.info("无资料且未调用工具，流式返回兜底 session=%s", request.session_id)
+                yield f"data: {NO_DATA_ANSWER}\n\n"
+                return
 
             # 第二阶段：带上工具结果，开启流式
             stream = client.chat.completions.create(
@@ -333,3 +338,4 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
+
